@@ -1,7 +1,10 @@
 """Azure AI Foundry client wrapper for speech and text services."""
 
+import contextlib
 import re
-from typing import Iterable, Optional
+import threading
+import wave
+from typing import Any, Callable, Iterable, List, Optional, Union
 
 REDACTED = "[redacted]"
 
@@ -16,10 +19,33 @@ _KEY_PATTERNS = (
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
 )
 
+# Margin under the service's 125,000-character asynchronous request cap. The
+# service counts grapheme clusters, not Python characters, so the two diverge.
+MAX_SUMMARY_INPUT_CHARS = 120_000
+SUMMARY_SENTENCE_COUNT = 4
 
-def sanitize_azure_error(error: BaseException, secrets: Iterable[Optional[str]] = ()) -> str:
-    """Return an Azure error message with credential material removed."""
-    message = str(error) or error.__class__.__name__
+# Wall-clock ceiling for a recognition session that never signals completion.
+MIN_TRANSCRIPTION_TIMEOUT = 120
+FALLBACK_TRANSCRIPTION_TIMEOUT = 900
+
+
+class TranscriptionError(Exception):
+    """Raised when Azure Speech cannot produce a transcript."""
+
+
+class SummarizationError(Exception):
+    """Raised when Azure Text Analytics cannot produce a summary."""
+
+
+def sanitize_azure_error(
+    error: Union[BaseException, str],
+    secrets: Iterable[Optional[str]] = (),
+) -> str:
+    """Return an Azure error message or diagnostic string with credentials removed."""
+    if isinstance(error, BaseException):
+        message = str(error) or error.__class__.__name__
+    else:
+        message = error
 
     for secret in secrets:
         if secret and len(secret) >= 8:
@@ -32,6 +58,38 @@ def sanitize_azure_error(error: BaseException, secrets: Iterable[Optional[str]] 
             message = pattern.sub(REDACTED, message)
 
     return message
+
+
+def _wav_duration_seconds(audio_file_path: str) -> Optional[float]:
+    """Duration of a WAV file in seconds, or None if it cannot be read."""
+    try:
+        with contextlib.closing(wave.open(audio_file_path, "rb")) as handle:
+            frame_rate = handle.getframerate()
+            if frame_rate <= 0:
+                return None
+            return handle.getnframes() / float(frame_rate)
+    except (wave.Error, OSError, EOFError):
+        return None
+
+
+def _split_for_summary(text: str) -> List[str]:
+    """Split text into chunks under the service character cap, on sentence boundaries."""
+    if len(text) <= MAX_SUMMARY_INPUT_CHARS:
+        return [text]
+
+    chunks: List[str] = []
+    current = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        if not sentence:
+            continue
+        if current and len(current) + 1 + len(sentence) > MAX_SUMMARY_INPUT_CHARS:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}" if current else sentence
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 class AzureSpeechClient:
@@ -55,25 +113,131 @@ class AzureSpeechClient:
         except ImportError:
             raise ImportError("azure-cognitiveservices-speech package required")
 
+    def _sanitize(self, value: Union[BaseException, str]) -> str:
+        """Scrub this client's key out of an SDK message."""
+        return sanitize_azure_error(value, (self.api_key,))
+
     def transcribe_file(self, audio_file_path: str, language: str = "en-US") -> str:
-        """Transcribe audio file to text."""
+        """Transcribe a whole WAV recording using continuous recognition."""
+        speechsdk = self.speechsdk
+        self.speech_config.speech_recognition_language = language
+
         try:
-            audio_config = self.speechsdk.audio.AudioConfig(filename=audio_file_path)
-            recognizer = self.speechsdk.SpeechRecognizer(
+            audio_config = speechsdk.audio.AudioConfig(filename=audio_file_path)
+            recognizer = speechsdk.SpeechRecognizer(
                 speech_config=self.speech_config,
-                audio_config=audio_config
+                audio_config=audio_config,
+            )
+        except Exception as e:
+            raise TranscriptionError(
+                "Could not open the audio file. Uploads must be WAV "
+                f"(16 kHz, 16-bit, mono PCM). ({self._sanitize(e)})"
+            ) from e
+
+        segments: List[str] = []
+        cancellation: List[Any] = []
+        done = threading.Event()
+
+        # These handlers run on SDK-owned threads with no Streamlit script
+        # context, so they may only touch plain Python objects.
+        def on_recognized(evt: Any) -> None:
+            result = evt.result
+            if result.reason == speechsdk.ResultReason.RecognizedSpeech and result.text:
+                segments.append(result.text)
+
+        def on_canceled(evt: Any) -> None:
+            details = getattr(evt, "cancellation_details", None)
+            if details is None:
+                details = getattr(getattr(evt, "result", None), "cancellation_details", None)
+            if details is not None:
+                cancellation.append(details)
+            done.set()
+
+        def on_session_stopped(evt: Any) -> None:
+            done.set()
+
+        recognizer.recognized.connect(on_recognized)
+        recognizer.canceled.connect(on_canceled)
+        recognizer.session_stopped.connect(on_session_stopped)
+
+        duration = _wav_duration_seconds(audio_file_path)
+        timeout = (
+            max(MIN_TRANSCRIPTION_TIMEOUT, int(duration * 2))
+            if duration
+            else FALLBACK_TRANSCRIPTION_TIMEOUT
+        )
+
+        try:
+            recognizer.start_continuous_recognition()
+            completed = done.wait(timeout=timeout)
+        finally:
+            # Stopping is done here rather than inside the callbacks: re-entering
+            # the SDK from an SDK-owned thread is a known source of hangs.
+            try:
+                recognizer.stop_continuous_recognition_async().get()
+            except Exception:
+                pass
+            recognizer.recognized.disconnect_all()
+            recognizer.canceled.disconnect_all()
+            recognizer.session_stopped.disconnect_all()
+
+        transcript = " ".join(segments).strip()
+
+        if cancellation:
+            details = cancellation[0]
+            # EndOfStream is the normal end-of-file signal, not a failure.
+            if details.reason == speechsdk.CancellationReason.Error:
+                raise TranscriptionError(self._cancellation_message(details, transcript))
+
+        if not completed:
+            raise TranscriptionError(
+                f"Transcription timed out after {timeout} seconds without Azure "
+                "signalling the end of the recording."
             )
 
-            result = recognizer.recognize_once()
+        if not transcript:
+            raise TranscriptionError(
+                "No speech was recognized in this recording. Check that the file "
+                "contains audible speech in the selected language and is WAV "
+                "(16 kHz, 16-bit, mono PCM)."
+            )
 
-            if result.reason == self.speechsdk.ResultReason.RecognizedSpeech:
-                return result.text
-            elif result.reason == self.speechsdk.ResultReason.NoMatch:
-                raise ValueError("Could not understand the audio")
-            elif result.reason == self.speechsdk.ResultReason.Canceled:
-                raise ValueError(f"Recognition failed: {result.cancellation_details.error_details}")
-        except Exception as e:
-            raise Exception(f"Transcription error: {str(e)}")
+        return transcript
+
+    def _cancellation_message(self, details: Any, transcript: str) -> str:
+        """Build a readable message for a cancelled recognition session."""
+        speechsdk = self.speechsdk
+        code = details.error_code
+        code_name = getattr(code, "name", str(code))
+        diagnostic = self._sanitize(details.error_details or "")
+        partial = (
+            f" {len(transcript)} characters were recognized before the failure."
+            if transcript
+            else ""
+        )
+
+        if code == speechsdk.CancellationErrorCode.AuthenticationFailure:
+            return (
+                "Azure rejected the Speech credentials. Check the Speech key and "
+                "region (AZURE_SPEECH_KEY / AZURE_SPEECH_REGION, or the sidebar form)."
+            )
+        if code in (
+            speechsdk.CancellationErrorCode.Forbidden,
+            speechsdk.CancellationErrorCode.TooManyRequests,
+        ):
+            return (
+                "Speech quota exhausted or throttled for this resource "
+                f"({code_name}). The free F0 tier allows 5 audio hours per month."
+            )
+        if code in (
+            speechsdk.CancellationErrorCode.ConnectionFailure,
+            speechsdk.CancellationErrorCode.ServiceTimeout,
+        ):
+            return (
+                "Lost the connection to Azure Speech mid-recording "
+                f"({code_name}: {diagnostic}).{partial}"
+            )
+        return f"Azure Speech cancelled recognition ({code_name}: {diagnostic}).{partial}"
 
 
 class AzureTextAnalyticsClient:
@@ -97,38 +261,91 @@ class AzureTextAnalyticsClient:
         except ImportError:
             raise ImportError("azure-ai-textanalytics package required")
 
+    def _sanitize(self, value: Union[BaseException, str]) -> str:
+        """Scrub this client's key out of an SDK message."""
+        return sanitize_azure_error(value, (self.api_key,))
+
     def extract_summary(self, text: str, language: str = "en") -> str:
-        """Extract summary from text."""
+        """Summarize a transcript with Azure abstractive summarization."""
+        if not text or not text.strip():
+            raise SummarizationError("There is no transcript text to summarize.")
+
+        # begin_abstract_summary takes ISO 639-1 ("en"); callers hold BCP-47
+        # locales ("en-US"). Truncating is only safe because SUPPORTED_LANGUAGES
+        # is a curated list whose six locales all map cleanly.
+        language_code = (language or "en")[:2].lower()
+
+        summaries = [
+            self._summarize_chunk(chunk, language_code)
+            for chunk in _split_for_summary(text.strip())
+        ]
+        summary = " ".join(part for part in summaries if part).strip()
+
+        if not summary:
+            raise SummarizationError("Azure returned an empty summary for this transcript.")
+        return summary
+
+    def _summarize_chunk(self, chunk: str, language: str) -> str:
+        """Run one abstractive summarization request and poll it to completion."""
+        from azure.core.exceptions import (
+            ClientAuthenticationError,
+            HttpResponseError,
+            ServiceRequestError,
+        )
+
         try:
-            # For MVP, we'll use a simple extractive summarization approach
-            # Split text into sentences and take key ones
-            sentences = text.split('. ')
+            poller = self.client.begin_abstract_summary(
+                [chunk],
+                language=language,
+                sentence_count=SUMMARY_SENTENCE_COUNT,
+                polling_interval=2,
+            )
+            results = poller.result()
+        except ClientAuthenticationError as e:
+            raise SummarizationError(
+                "Azure rejected the Text Analytics key (AZURE_TEXT_ANALYTICS_KEY, "
+                "or the sidebar form)."
+            ) from e
+        except ServiceRequestError as e:
+            raise SummarizationError(
+                f"Could not reach Azure Text Analytics: {self._sanitize(e)}"
+            ) from e
+        except HttpResponseError as e:
+            raise SummarizationError(self._http_message(e)) from e
 
-            if len(sentences) <= 3:
-                return text
+        for document in results:
+            if document.is_error:
+                raise SummarizationError(
+                    "Azure could not summarize this transcript "
+                    f"({document.error.code}: {self._sanitize(document.error.message or '')})."
+                )
+            return " ".join(
+                item.text for item in (document.summaries or []) if item.text
+            ).strip()
 
-            # Simple heuristic: take first and last sentence + longest sentence
-            summary_sentences = [sentences[0]]
-            longest_idx = 0
-            longest_len = len(sentences[0])
+        raise SummarizationError("Azure returned no summarization result for this transcript.")
 
-            for i, sent in enumerate(sentences[1:-1], 1):
-                if len(sent) > longest_len:
-                    longest_len = len(sent)
-                    longest_idx = i
+    def _http_message(self, error: BaseException) -> str:
+        """Map an HTTP failure from the Language service to actionable text."""
+        status = getattr(error, "status_code", None)
+        diagnostic = self._sanitize(error)
 
-            if longest_idx not in [0, len(sentences) - 1]:
-                summary_sentences.append(sentences[longest_idx])
-
-            summary_sentences.append(sentences[-1])
-            summary = '. '.join(summary_sentences)
-
-            if not summary.endswith('.'):
-                summary += '.'
-
-            return summary
-        except Exception as e:
-            raise Exception(f"Summarization error: {str(e)}")
+        if status == 403:
+            return (
+                "Azure refused the summarization request (403). Abstractive "
+                "summarization requires a Language resource on the Standard (S) "
+                "pricing tier in a region that supports it; the free F0 tier "
+                f"cannot run it. {diagnostic}"
+            )
+        if status == 404:
+            return (
+                "Azure Text Analytics endpoint not found (404). Check that "
+                "AZURE_TEXT_ANALYTICS_ENDPOINT points at the Language resource. "
+                f"{diagnostic}"
+            )
+        if status == 400:
+            return f"Azure rejected the summarization request (400): {diagnostic}"
+        return f"Azure Text Analytics failed: {diagnostic}"
 
 
 class AzureFoundryClient:
@@ -144,16 +361,19 @@ class AzureFoundryClient:
         """Return the secret values held by this client, for error sanitization."""
         return (self.speech_client.api_key, self.text_client.api_key)
 
-    def transcribe_and_summarize(self, audio_file_path: str,
-                                 language: str = "en-US") -> tuple[str, str]:
-        """Transcribe audio file and generate summary."""
-        try:
-            # Step 1: Transcribe
-            transcript = self.speech_client.transcribe_file(audio_file_path, language)
+    def transcribe_and_summarize(
+        self,
+        audio_file_path: str,
+        language: str = "en-US",
+        on_stage: Optional[Callable[[str], None]] = None,
+    ) -> tuple[str, str]:
+        """Transcribe an audio file and summarize it, reporting each stage to `on_stage`."""
+        if on_stage:
+            on_stage("transcribing")
+        transcript = self.speech_client.transcribe_file(audio_file_path, language)
 
-            # Step 2: Summarize
-            summary = self.text_client.extract_summary(transcript, language[:2])
+        if on_stage:
+            on_stage("summarizing")
+        summary = self.text_client.extract_summary(transcript, language)
 
-            return transcript, summary
-        except Exception as e:
-            raise Exception(f"Processing failed: {str(e)}")
+        return transcript, summary

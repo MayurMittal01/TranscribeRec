@@ -12,7 +12,8 @@ if _REPO_ROOT not in sys.path:
 import streamlit as st
 
 from src.config import (
-    APP_NAME, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, env_credentials
+    APP_NAME, ALLOWED_AUDIO_FORMATS, AUDIO_FORMAT_HELP, SUPPORTED_LANGUAGES,
+    DEFAULT_LANGUAGE, env_credentials
 )
 from src.database import Database
 from src.azure_client import AzureFoundryClient, sanitize_azure_error
@@ -24,6 +25,12 @@ CREDENTIAL_FIELDS = (
     "text_analytics_endpoint",
     "text_analytics_key",
 )
+
+STAGE_LABELS = {
+    "transcribing": "Transcribing audio with Azure Speech — this runs the whole "
+                    "recording and can take a minute or more...",
+    "summarizing": "Summarizing the transcript with Azure Text Analytics...",
+}
 
 # Page configuration
 st.set_page_config(
@@ -193,9 +200,10 @@ def upload_page():
     with col1:
         uploaded_file = st.file_uploader(
             "Choose an audio file",
-            type=["wav", "mp3", "m4a", "flac", "ogg"],
-            help="Supported formats: WAV, MP3, M4A, FLAC, OGG"
+            type=ALLOWED_AUDIO_FORMATS,
+            help=AUDIO_FORMAT_HELP
         )
+        st.caption(AUDIO_FORMAT_HELP)
 
     with col2:
         language = st.selectbox(
@@ -213,82 +221,81 @@ def upload_page():
 
 
 def process_recording(uploaded_file, language: str):
-    """Process the uploaded recording."""
+    """Process the uploaded recording and display the transcript and summary."""
     try:
-        # Save file
-        with st.spinner("Saving file..."):
+        failure = None
+        result = None
+
+        with st.status("Saving upload...", expanded=True) as status:
             file_path, file_size = save_uploaded_file(uploaded_file)
-            st.success("✓ File saved")
 
-        # Add to database
-        recording_id = st.session_state.db.add_recording(
-            uploaded_file.name,
-            file_path,
-            file_size,
-            language
-        )
-
-        # Get transcription record
-        transcription = st.session_state.db.get_transcription(recording_id)
-        transcription_id = transcription['id']
-
-        # Transcribe and summarize
-        progress_bar = st.progress(0, text="Processing audio...")
-
-        try:
-            azure_client = build_azure_client()
-
-            progress_bar.progress(50, text="Transcribing audio...")
-            transcript, summary = azure_client.transcribe_and_summarize(
+            recording_id = st.session_state.db.add_recording(
+                uploaded_file.name,
                 file_path,
+                file_size,
                 language
             )
+            transcription_id = st.session_state.db.get_transcription(recording_id)['id']
 
-            # Update transcription
-            st.session_state.db.update_transcription(
-                transcription_id,
-                transcript,
-                "completed"
+            def report_stage(stage: str) -> None:
+                """Update the status label as the Azure pipeline moves between stages."""
+                status.update(label=STAGE_LABELS.get(stage, stage))
+
+            try:
+                azure_client = build_azure_client()
+                transcript, summary = azure_client.transcribe_and_summarize(
+                    file_path,
+                    language,
+                    on_stage=report_stage
+                )
+
+                status.update(label="Saving results...")
+                st.session_state.db.update_transcription(
+                    transcription_id,
+                    transcript,
+                    "completed"
+                )
+                summary_id = st.session_state.db.add_summary(transcription_id)
+                st.session_state.db.update_summary(summary_id, summary, "completed")
+
+                st.session_state.azure_status = ("ok", "")
+                status.update(label="Done", state="complete", expanded=False)
+                result = (recording_id, transcript, summary)
+
+            except Exception as e:
+                failure = sanitize_azure_error(e, _secret_values())
+                st.session_state.db.update_transcription_error(transcription_id, failure)
+                st.session_state.azure_status = ("error", failure)
+                status.update(label="Processing failed", state="error", expanded=False)
+
+        if failure:
+            st.error(f"❌ Processing failed: {failure}")
+            return
+
+        recording_id, transcript, summary = result
+        st.success("✓ Processing complete!")
+
+        st.subheader("📝 Transcription")
+        st.text_area("Transcript", transcript, height=150, disabled=True)
+
+        st.subheader("📊 Summary")
+        st.text_area("Summary", summary, height=100, disabled=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                label="📥 Download Transcript (TXT)",
+                data=transcript,
+                file_name=f"transcript_{recording_id}.txt",
+                mime="text/plain"
             )
-
-            # Add and update summary
-            progress_bar.progress(75, text="Generating summary...")
-            summary_id = st.session_state.db.add_summary(transcription_id)
-            st.session_state.db.update_summary(summary_id, summary, "completed")
-
-            progress_bar.progress(100, text="Complete!")
-            st.session_state.azure_status = ("ok", "")
-            st.success("✓ Processing complete!")
-
-            # Display results
-            st.subheader("📝 Transcription")
-            st.text_area("Transcript", transcript, height=150, disabled=True)
-
-            st.subheader("📊 Summary")
-            st.text_area("Summary", summary, height=100, disabled=True)
-
-            # Download options
-            col1, col2 = st.columns(2)
-            with col1:
-                st.download_button(
-                    label="📥 Download Transcript (TXT)",
-                    data=transcript,
-                    file_name=f"transcript_{recording_id}.txt",
-                    mime="text/plain"
-                )
-            with col2:
-                st.download_button(
-                    label="📥 Download Summary (TXT)",
-                    data=summary,
-                    file_name=f"summary_{recording_id}.txt",
-                    mime="text/plain"
-                )
-
-        except Exception as e:
-            message = sanitize_azure_error(e, _secret_values())
-            st.session_state.db.update_transcription_error(transcription_id, message)
-            st.session_state.azure_status = ("error", message)
-            st.error(f"❌ Processing failed: {message}")
+        with col2:
+            st.download_button(
+                label="📥 Download Summary (TXT)",
+                data=summary,
+                file_name=f"summary_{recording_id}.txt",
+                mime="text/plain"
+            )
 
     except ValueError as e:
         st.error(f"❌ File error: {str(e)}")

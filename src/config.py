@@ -33,7 +33,15 @@ UPLOADS_PATH = "data/uploads"
 
 # File Upload Configuration
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
-ALLOWED_AUDIO_FORMATS = ["wav", "mp3", "m4a", "flac", "ogg"]
+
+# WAV only: the Speech SDK's AudioConfig(filename=...) decodes WAV/PCM natively,
+# and every other container needs GStreamer binaries on PATH.
+ALLOWED_AUDIO_FORMATS = ["wav"]
+AUDIO_FORMAT_HELP = (
+    "WAV only (16 kHz, 16-bit, mono PCM). Azure Speech reads WAV directly; "
+    "MP3, M4A, FLAC and OGG need a GStreamer runtime on PATH, so they are "
+    "not accepted here. Convert to WAV before uploading."
+)
 
 # Processing Configuration
 SUPPORTED_LANGUAGES = {
