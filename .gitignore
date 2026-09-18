@@ -34,6 +34,9 @@ ENV/
 env/
 .venv
 
+# Claude Code — agents are shared, local settings are not
+.claude/settings.local.json
+
 # IDE
 .vscode/
 .idea/
