@@ -135,14 +135,17 @@ class Database:
                 WHERE id = ?
             """, (transcript, status, transcription_id))
 
-    def update_transcription_error(self, transcription_id: int, error_message: str) -> None:
-        """Mark transcription as failed with error message."""
+    def update_transcription_error(self, transcription_id: int, error_message: str,
+                                   partial_transcript: Optional[str] = None) -> None:
+        """Mark a transcription failed, keeping any text recognized before the failure."""
+        status = "partial" if partial_transcript else "failed"
         with self._cursor(commit=True) as cursor:
             cursor.execute("""
                 UPDATE transcriptions
-                SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP
+                SET status = ?, transcript = ?, error_message = ?,
+                    completed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-            """, (error_message, transcription_id))
+            """, (status, partial_transcript, error_message, transcription_id))
 
     def get_transcription(self, recording_id: int) -> Optional[Dict[str, Any]]:
         """Get transcription for a recording."""
@@ -174,6 +177,15 @@ class Database:
                 SET summary_text = ?, status = ?, summary_length = ?, completed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             """, (summary_text, status, len(summary_text), summary_id))
+
+    def update_summary_error(self, summary_id: int, error_message: str) -> None:
+        """Mark a summary as failed with an error message."""
+        with self._cursor(commit=True) as cursor:
+            cursor.execute("""
+                UPDATE summaries
+                SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (error_message, summary_id))
 
     def get_summary(self, transcription_id: int) -> Optional[Dict[str, Any]]:
         """Get summary for a transcription."""

@@ -4,6 +4,7 @@ import contextlib
 import re
 import threading
 import wave
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, List, Optional, Union
 
 REDACTED = "[redacted]"
@@ -28,13 +29,32 @@ SUMMARY_SENTENCE_COUNT = 4
 MIN_TRANSCRIPTION_TIMEOUT = 120
 FALLBACK_TRANSCRIPTION_TIMEOUT = 900
 
+# SDK diagnostics run to hundreds of characters — native call stacks from the
+# Speech SDK, whole HTML error pages from azure-core's "Content:" dump. They are
+# rendered in st.error and stored in the database, so they are bounded here.
+MAX_DIAGNOSTIC_CHARS = 200
+
 
 class TranscriptionError(Exception):
     """Raised when Azure Speech cannot produce a transcript."""
 
+    def __init__(self, message: str, partial_transcript: str = "") -> None:
+        """Record the failure, keeping any text recognized before it."""
+        super().__init__(message)
+        self.partial_transcript = partial_transcript
+
 
 class SummarizationError(Exception):
     """Raised when Azure Text Analytics cannot produce a summary."""
+
+
+@dataclass
+class PipelineResult:
+    """Outcome of one transcribe-then-summarize run; the summary may be missing."""
+
+    transcript: str
+    summary: Optional[str] = None
+    summary_error: Optional[str] = None
 
 
 def sanitize_azure_error(
@@ -58,6 +78,22 @@ def sanitize_azure_error(
             message = pattern.sub(REDACTED, message)
 
     return message
+
+
+def brief_diagnostic(
+    error: Union[BaseException, str],
+    secrets: Iterable[Optional[str]] = (),
+    limit: int = MAX_DIAGNOSTIC_CHARS,
+) -> str:
+    """Return the sanitized first line of an SDK diagnostic, truncated to `limit`."""
+    message = sanitize_azure_error(error, secrets).strip()
+    if not message:
+        return ""
+
+    first_line = message.splitlines()[0].strip()
+    if len(first_line) > limit:
+        return first_line[:limit].rstrip() + "..."
+    return first_line
 
 
 def _wav_duration_seconds(audio_file_path: str) -> Optional[float]:
@@ -113,9 +149,9 @@ class AzureSpeechClient:
         except ImportError:
             raise ImportError("azure-cognitiveservices-speech package required")
 
-    def _sanitize(self, value: Union[BaseException, str]) -> str:
-        """Scrub this client's key out of an SDK message."""
-        return sanitize_azure_error(value, (self.api_key,))
+    def _brief(self, value: Union[BaseException, str]) -> str:
+        """Scrub and shorten an SDK diagnostic for display and storage."""
+        return brief_diagnostic(value, (self.api_key,))
 
     def transcribe_file(self, audio_file_path: str, language: str = "en-US") -> str:
         """Transcribe a whole WAV recording using continuous recognition."""
@@ -131,7 +167,7 @@ class AzureSpeechClient:
         except Exception as e:
             raise TranscriptionError(
                 "Could not open the audio file. Uploads must be WAV "
-                f"(16 kHz, 16-bit, mono PCM). ({self._sanitize(e)})"
+                f"(16 kHz, 16-bit, mono PCM). ({self._brief(e)})"
             ) from e
 
         segments: List[str] = []
@@ -187,12 +223,22 @@ class AzureSpeechClient:
             details = cancellation[0]
             # EndOfStream is the normal end-of-file signal, not a failure.
             if details.reason == speechsdk.CancellationReason.Error:
-                raise TranscriptionError(self._cancellation_message(details, transcript))
+                raise TranscriptionError(
+                    self._cancellation_message(details, transcript),
+                    partial_transcript=transcript,
+                )
 
         if not completed:
             raise TranscriptionError(
                 f"Transcription timed out after {timeout} seconds without Azure "
                 "signalling the end of the recording."
+                + (
+                    f" {len(transcript)} characters recognized before the timeout "
+                    "have been kept."
+                    if transcript
+                    else ""
+                ),
+                partial_transcript=transcript,
             )
 
         if not transcript:
@@ -207,11 +253,14 @@ class AzureSpeechClient:
     def _cancellation_message(self, details: Any, transcript: str) -> str:
         """Build a readable message for a cancelled recognition session."""
         speechsdk = self.speechsdk
-        code = details.error_code
+        # CancellationDetails exposes `code`, not `error_code`; reading the wrong
+        # attribute raised inside this handler and masked every message below.
+        code = details.code
         code_name = getattr(code, "name", str(code))
-        diagnostic = self._sanitize(details.error_details or "")
+        diagnostic = self._brief(details.error_details or "")
         partial = (
-            f" {len(transcript)} characters were recognized before the failure."
+            f" The {len(transcript)} characters recognized before the failure "
+            "have been kept."
             if transcript
             else ""
         )
@@ -227,7 +276,8 @@ class AzureSpeechClient:
         ):
             return (
                 "Speech quota exhausted or throttled for this resource "
-                f"({code_name}). The free F0 tier allows 5 audio hours per month."
+                f"({code_name}). The free F0 tier allows 5 audio hours per "
+                f"month.{partial}"
             )
         if code in (
             speechsdk.CancellationErrorCode.ConnectionFailure,
@@ -261,9 +311,9 @@ class AzureTextAnalyticsClient:
         except ImportError:
             raise ImportError("azure-ai-textanalytics package required")
 
-    def _sanitize(self, value: Union[BaseException, str]) -> str:
-        """Scrub this client's key out of an SDK message."""
-        return sanitize_azure_error(value, (self.api_key,))
+    def _brief(self, value: Union[BaseException, str]) -> str:
+        """Scrub and shorten an SDK diagnostic for display and storage."""
+        return brief_diagnostic(value, (self.api_key,))
 
     def extract_summary(self, text: str, language: str = "en") -> str:
         """Summarize a transcript with Azure abstractive summarization."""
@@ -291,6 +341,7 @@ class AzureTextAnalyticsClient:
             ClientAuthenticationError,
             HttpResponseError,
             ServiceRequestError,
+            ServiceResponseError,
         )
 
         try:
@@ -300,24 +351,31 @@ class AzureTextAnalyticsClient:
                 sentence_count=SUMMARY_SENTENCE_COUNT,
                 polling_interval=2,
             )
-            results = poller.result()
+            # poller.result() returns a lazy ItemPaged whose page extraction can
+            # itself raise HttpResponseError, so it must be drained in here.
+            documents = list(poller.result())
         except ClientAuthenticationError as e:
             raise SummarizationError(
                 "Azure rejected the Text Analytics key (AZURE_TEXT_ANALYTICS_KEY, "
                 "or the sidebar form)."
             ) from e
-        except ServiceRequestError as e:
+        except (ServiceRequestError, ServiceResponseError) as e:
+            # ServiceResponseError is a sibling of ServiceRequestError, not a
+            # subclass: read timeout, dropped connection, or an endpoint pasted
+            # without its https:// scheme.
             raise SummarizationError(
-                f"Could not reach Azure Text Analytics: {self._sanitize(e)}"
+                "Could not reach Azure Text Analytics. Check the network and that "
+                "AZURE_TEXT_ANALYTICS_ENDPOINT starts with https:// "
+                f"({self._brief(e)})."
             ) from e
         except HttpResponseError as e:
             raise SummarizationError(self._http_message(e)) from e
 
-        for document in results:
+        for document in documents:
             if document.is_error:
                 raise SummarizationError(
                     "Azure could not summarize this transcript "
-                    f"({document.error.code}: {self._sanitize(document.error.message or '')})."
+                    f"({document.error.code}: {self._brief(document.error.message or '')})."
                 )
             return " ".join(
                 item.text for item in (document.summaries or []) if item.text
@@ -328,7 +386,7 @@ class AzureTextAnalyticsClient:
     def _http_message(self, error: BaseException) -> str:
         """Map an HTTP failure from the Language service to actionable text."""
         status = getattr(error, "status_code", None)
-        diagnostic = self._sanitize(error)
+        diagnostic = self._brief(error)
 
         if status == 403:
             return (
@@ -366,14 +424,35 @@ class AzureFoundryClient:
         audio_file_path: str,
         language: str = "en-US",
         on_stage: Optional[Callable[[str], None]] = None,
-    ) -> tuple[str, str]:
-        """Transcribe an audio file and summarize it, reporting each stage to `on_stage`."""
+        on_transcript: Optional[Callable[[str], None]] = None,
+    ) -> PipelineResult:
+        """Transcribe an audio file then summarize it, reporting stages to `on_stage`.
+
+        `on_transcript` is called with the transcript as soon as Speech returns it,
+        so the caller can persist billed work before summarization is attempted. A
+        summarization failure is reported on the result, not raised: the transcript
+        is the expensive half and must survive it.
+        """
         if on_stage:
             on_stage("transcribing")
         transcript = self.speech_client.transcribe_file(audio_file_path, language)
 
+        if on_transcript:
+            on_transcript(transcript)
+
         if on_stage:
             on_stage("summarizing")
-        summary = self.text_client.extract_summary(transcript, language)
+        try:
+            summary = self.text_client.extract_summary(transcript, language)
+        except SummarizationError as e:
+            return PipelineResult(transcript=transcript, summary_error=str(e))
+        except Exception as e:
+            return PipelineResult(
+                transcript=transcript,
+                summary_error=(
+                    "Summarization failed unexpectedly: "
+                    f"{brief_diagnostic(e, self.secrets())}"
+                ),
+            )
 
-        return transcript, summary
+        return PipelineResult(transcript=transcript, summary=summary)

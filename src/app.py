@@ -219,13 +219,15 @@ def upload_page():
         if st.button("🚀 Process Recording", type="primary", disabled=not ready):
             process_recording(uploaded_file, language)
 
+    render_last_run()
 
-def process_recording(uploaded_file, language: str):
-    """Process the uploaded recording and display the transcript and summary."""
+
+def process_recording(uploaded_file, language: str) -> None:
+    """Process the uploaded recording, persisting each stage the moment it completes."""
+    st.session_state.pop("last_run", None)
+    run: dict[str, object] = {}
+
     try:
-        failure = None
-        result = None
-
         with st.status("Saving upload...", expanded=True) as status:
             file_path, file_size = save_uploaded_file(uploaded_file)
 
@@ -236,73 +238,120 @@ def process_recording(uploaded_file, language: str):
                 language
             )
             transcription_id = st.session_state.db.get_transcription(recording_id)['id']
+            run = {"recording_id": recording_id, "filename": uploaded_file.name}
 
             def report_stage(stage: str) -> None:
                 """Update the status label as the Azure pipeline moves between stages."""
                 status.update(label=STAGE_LABELS.get(stage, stage))
 
-            try:
-                azure_client = build_azure_client()
-                transcript, summary = azure_client.transcribe_and_summarize(
-                    file_path,
-                    language,
-                    on_stage=report_stage
-                )
-
-                status.update(label="Saving results...")
+            def save_transcript(transcript: str) -> None:
+                """Commit the transcript before summarization is attempted."""
                 st.session_state.db.update_transcription(
                     transcription_id,
                     transcript,
                     "completed"
                 )
-                summary_id = st.session_state.db.add_summary(transcription_id)
-                st.session_state.db.update_summary(summary_id, summary, "completed")
 
-                st.session_state.azure_status = ("ok", "")
-                status.update(label="Done", state="complete", expanded=False)
-                result = (recording_id, transcript, summary)
+            try:
+                azure_client = build_azure_client()
+                result = azure_client.transcribe_and_summarize(
+                    file_path,
+                    language,
+                    on_stage=report_stage,
+                    on_transcript=save_transcript,
+                )
+
+                status.update(label="Saving results...")
+                summary_id = st.session_state.db.add_summary(transcription_id)
+                if result.summary_error:
+                    st.session_state.db.update_summary_error(summary_id, result.summary_error)
+                    st.session_state.azure_status = ("error", result.summary_error)
+                    status.update(
+                        label="Transcribed — summary failed",
+                        state="error",
+                        expanded=False,
+                    )
+                else:
+                    st.session_state.db.update_summary(summary_id, result.summary, "completed")
+                    st.session_state.azure_status = ("ok", "")
+                    status.update(label="Done", state="complete", expanded=False)
+
+                run.update(
+                    transcript=result.transcript,
+                    summary=result.summary,
+                    summary_error=result.summary_error,
+                )
 
             except Exception as e:
                 failure = sanitize_azure_error(e, _secret_values())
-                st.session_state.db.update_transcription_error(transcription_id, failure)
+                partial = getattr(e, "partial_transcript", "") or ""
+                st.session_state.db.update_transcription_error(
+                    transcription_id, failure, partial or None
+                )
                 st.session_state.azure_status = ("error", failure)
                 status.update(label="Processing failed", state="error", expanded=False)
-
-        if failure:
-            st.error(f"❌ Processing failed: {failure}")
-            return
-
-        recording_id, transcript, summary = result
-        st.success("✓ Processing complete!")
-
-        st.subheader("📝 Transcription")
-        st.text_area("Transcript", transcript, height=150, disabled=True)
-
-        st.subheader("📊 Summary")
-        st.text_area("Summary", summary, height=100, disabled=True)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                label="📥 Download Transcript (TXT)",
-                data=transcript,
-                file_name=f"transcript_{recording_id}.txt",
-                mime="text/plain"
-            )
-        with col2:
-            st.download_button(
-                label="📥 Download Summary (TXT)",
-                data=summary,
-                file_name=f"summary_{recording_id}.txt",
-                mime="text/plain"
-            )
+                run.update(transcript=partial, error=failure)
 
     except ValueError as e:
-        st.error(f"❌ File error: {str(e)}")
+        run["error"] = f"File error: {sanitize_azure_error(e, _secret_values())}"
     except OSError as e:
-        st.error(f"❌ Could not save the upload: {str(e)}")
+        run["error"] = (
+            f"Could not save the upload: {sanitize_azure_error(e, _secret_values())}"
+        )
     except Exception as e:
-        st.error(f"❌ Unexpected error: {sanitize_azure_error(e, _secret_values())}")
+        run["error"] = f"Unexpected error: {sanitize_azure_error(e, _secret_values())}"
+
+    st.session_state.last_run = run
+
+
+def render_last_run() -> None:
+    """Render the most recent processing outcome from session state.
+
+    Results live in session state because st.download_button triggers a rerun, on
+    which the Process button is False and locals from the run are gone.
+    """
+    run = st.session_state.get("last_run")
+    if not run:
+        return
+
+    recording_id = run.get("recording_id")
+    transcript = run.get("transcript")
+    summary = run.get("summary")
+
+    if run.get("error"):
+        st.error(f"❌ Processing failed: {run['error']}")
+
+    if transcript:
+        if not run.get("error") and not run.get("summary_error"):
+            st.success("✓ Processing complete!")
+
+        st.subheader("📝 Transcription")
+        st.text_area("Transcript", transcript, height=150, disabled=True,
+                     key="last_run_transcript")
+        st.download_button(
+            label="📥 Download Transcript (TXT)",
+            data=transcript,
+            file_name=f"transcript_{recording_id}.txt",
+            mime="text/plain",
+            key="last_run_download_transcript",
+        )
+
+    if run.get("summary_error"):
+        st.warning(
+            "⚠️ The transcript was saved, but summarization failed: "
+            f"{run['summary_error']}"
+        )
+    elif summary:
+        st.subheader("📊 Summary")
+        st.text_area("Summary", summary, height=100, disabled=True,
+                     key="last_run_summary")
+        st.download_button(
+            label="📥 Download Summary (TXT)",
+            data=summary,
+            file_name=f"summary_{recording_id}.txt",
+            mime="text/plain",
+            key="last_run_download_summary",
+        )
 
 
 def history_page():
@@ -357,7 +406,12 @@ def history_page():
                     key=f"download_transcript_{recording_id}"
                 )
 
-            if summary and summary['summary_text']:
+            if summary and summary['error_message']:
+                st.warning(
+                    "Transcript saved, but summarization failed: "
+                    f"{summary['error_message']}"
+                )
+            elif summary and summary['summary_text']:
                 st.subheader("Summary")
                 st.text_area(
                     "Summary",
@@ -376,7 +430,13 @@ def history_page():
                 )
 
             if transcription and transcription['error_message']:
-                st.error(f"Error: {transcription['error_message']}")
+                if transcription['status'] == 'partial':
+                    st.warning(
+                        "Partial transcript — transcription did not finish: "
+                        f"{transcription['error_message']}"
+                    )
+                else:
+                    st.error(f"Error: {transcription['error_message']}")
 
 
 if __name__ == "__main__":
