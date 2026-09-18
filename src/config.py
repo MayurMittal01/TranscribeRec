@@ -5,11 +5,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Azure Configuration
+# Azure Configuration. These are the fallback used when the sidebar form is
+# left blank; they are never the only source of credentials at runtime.
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "eastus")
 AZURE_TEXT_ANALYTICS_ENDPOINT = os.getenv("AZURE_TEXT_ANALYTICS_ENDPOINT")
 AZURE_TEXT_ANALYTICS_KEY = os.getenv("AZURE_TEXT_ANALYTICS_KEY")
+
+
+def env_credentials() -> dict[str, str]:
+    """Return Azure credentials sourced from the environment, blanks where unset."""
+    return {
+        "speech_key": AZURE_SPEECH_KEY or "",
+        "speech_region": AZURE_SPEECH_REGION or "",
+        "text_analytics_endpoint": AZURE_TEXT_ANALYTICS_ENDPOINT or "",
+        "text_analytics_key": AZURE_TEXT_ANALYTICS_KEY or "",
+    }
 
 # Application Configuration
 APP_NAME = os.getenv("APP_NAME", "TranscribeRec")

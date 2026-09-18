@@ -1,19 +1,46 @@
 """Azure AI Foundry client wrapper for speech and text services."""
 
-import os
-from typing import Optional
-from config import (
-    AZURE_SPEECH_KEY, AZURE_SPEECH_REGION,
-    AZURE_TEXT_ANALYTICS_ENDPOINT, AZURE_TEXT_ANALYTICS_KEY
+import re
+from typing import Iterable, Optional
+
+REDACTED = "[redacted]"
+
+# Azure SDK exceptions routinely echo the subscription key back in the message
+# (request headers, signed URLs, "Access denied due to invalid subscription key
+# ... <key>"). These patterns scrub key-shaped material we were not handed.
+_KEY_PATTERNS = (
+    re.compile(r"(Ocp-Apim-Subscription-Key\s*[:=]\s*)[^\s&,;\"']+", re.IGNORECASE),
+    re.compile(r"(subscription[-_ ]?key\s*[:=]\s*)[^\s&,;\"']+", re.IGNORECASE),
+    re.compile(r"([?&](?:subscription-key|key|sig|access_token)=)[^&\s]+", re.IGNORECASE),
+    re.compile(r"(Authorization\s*[:=]\s*(?:Bearer|Basic)\s+)\S+", re.IGNORECASE),
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
 )
+
+
+def sanitize_azure_error(error: BaseException, secrets: Iterable[Optional[str]] = ()) -> str:
+    """Return an Azure error message with credential material removed."""
+    message = str(error) or error.__class__.__name__
+
+    for secret in secrets:
+        if secret and len(secret) >= 8:
+            message = message.replace(secret, REDACTED)
+
+    for pattern in _KEY_PATTERNS:
+        if pattern.groups:
+            message = pattern.sub(lambda m: m.group(1) + REDACTED, message)
+        else:
+            message = pattern.sub(REDACTED, message)
+
+    return message
+
 
 class AzureSpeechClient:
     """Wrapper for Azure Speech-to-Text service."""
 
-    def __init__(self):
-        """Initialize Azure Speech client."""
-        self.api_key = AZURE_SPEECH_KEY
-        self.region = AZURE_SPEECH_REGION
+    def __init__(self, api_key: str, region: str):
+        """Initialize Azure Speech client with explicit credentials."""
+        self.api_key = api_key
+        self.region = region
 
         if not self.api_key or not self.region:
             raise ValueError("Azure Speech credentials not configured")
@@ -52,10 +79,10 @@ class AzureSpeechClient:
 class AzureTextAnalyticsClient:
     """Wrapper for Azure Text Analytics service."""
 
-    def __init__(self):
-        """Initialize Azure Text Analytics client."""
-        self.endpoint = AZURE_TEXT_ANALYTICS_ENDPOINT
-        self.api_key = AZURE_TEXT_ANALYTICS_KEY
+    def __init__(self, endpoint: str, api_key: str):
+        """Initialize Azure Text Analytics client with explicit credentials."""
+        self.endpoint = endpoint
+        self.api_key = api_key
 
         if not self.endpoint or not self.api_key:
             raise ValueError("Azure Text Analytics credentials not configured")
@@ -107,13 +134,18 @@ class AzureTextAnalyticsClient:
 class AzureFoundryClient:
     """Unified client for Azure Foundry services."""
 
-    def __init__(self):
-        """Initialize Azure Foundry client."""
-        self.speech_client = AzureSpeechClient()
-        self.text_client = AzureTextAnalyticsClient()
+    def __init__(self, speech_key: str, speech_region: str,
+                 text_analytics_endpoint: str, text_analytics_key: str):
+        """Initialize both Azure clients from explicit credentials."""
+        self.speech_client = AzureSpeechClient(speech_key, speech_region)
+        self.text_client = AzureTextAnalyticsClient(text_analytics_endpoint, text_analytics_key)
+
+    def secrets(self) -> tuple[Optional[str], ...]:
+        """Return the secret values held by this client, for error sanitization."""
+        return (self.speech_client.api_key, self.text_client.api_key)
 
     def transcribe_and_summarize(self, audio_file_path: str,
-                                language: str = "en-US") -> tuple[str, str]:
+                                 language: str = "en-US") -> tuple[str, str]:
         """Transcribe audio file and generate summary."""
         try:
             # Step 1: Transcribe

@@ -72,6 +72,21 @@ cp .env.example .env
 # AZURE_TEXT_ANALYTICS_KEY=your_analytics_key
 ```
 
+### 5b. Or Enter Credentials in the Sidebar
+
+`.env` is optional. The app starts without it and offers a credential form in the
+sidebar for the Speech key, Speech region, Text Analytics endpoint, and Text
+Analytics key. Keys are masked on entry, held in Streamlit session state for the
+life of the browser session, and never written to `.env`, to the database, or to
+any log. A blank sidebar field falls back to the matching `.env` value, so the
+two paths can be mixed. "Clear credentials" blanks the form.
+
+> **Deployment caveat**: the sidebar form is for **local demo use**. On a shared or
+> publicly reachable deployment, typing a production key into a web form exposes it
+> to anyone who can reach the page. Hosted deployments should supply credentials
+> through platform secrets (for example Streamlit Cloud's secrets manager) and
+> leave the sidebar form blank.
+
 ## Running the Application
 
 ### Development

@@ -1,16 +1,29 @@
 """Main Streamlit application for TranscribeRec."""
 
-import streamlit as st
 import os
 import sys
 
-# Add src directory to path
-sys.path.insert(0, os.path.dirname(__file__))
+# `streamlit run src/app.py` puts src/ on sys.path but not the repo root, so the
+# src package is not importable until its parent directory is added.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-from config import APP_NAME, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE
-from database import Database
-from azure_client import AzureFoundryClient
-from utils import save_uploaded_file, format_timestamp, cleanup_old_files
+import streamlit as st
+
+from src.config import (
+    APP_NAME, SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, env_credentials
+)
+from src.database import Database
+from src.azure_client import AzureFoundryClient, sanitize_azure_error
+from src.utils import save_uploaded_file, format_timestamp, cleanup_old_files
+
+CREDENTIAL_FIELDS = (
+    "speech_key",
+    "speech_region",
+    "text_analytics_endpoint",
+    "text_analytics_key",
+)
 
 # Page configuration
 st.set_page_config(
@@ -36,18 +49,120 @@ st.markdown("""
 if 'db' not in st.session_state:
     st.session_state.db = Database()
 
-if 'azure_client' not in st.session_state:
-    try:
-        st.session_state.azure_client = AzureFoundryClient()
-    except ValueError as e:
-        st.error(f"Azure configuration error: {str(e)}")
-        st.info("Please configure Azure credentials in .env file")
+
+def _widget_key(field: str) -> str:
+    """Session state key holding the sidebar input for a credential field."""
+    return f"cred_{field}"
+
+
+def resolve_credentials() -> dict[str, str]:
+    """Merge sidebar credentials over .env values; a blank sidebar field falls back."""
+    env = env_credentials()
+    resolved = {}
+    for field in CREDENTIAL_FIELDS:
+        entered = (st.session_state.get(_widget_key(field)) or "").strip()
+        resolved[field] = entered or env[field]
+    return resolved
+
+
+def _secret_values() -> tuple[str, ...]:
+    """Current secret values, used to scrub them out of Azure error messages."""
+    credentials = resolve_credentials()
+    return (credentials["speech_key"], credentials["text_analytics_key"])
+
+
+def credentials_ready() -> bool:
+    """True when every credential needed to reach both Azure services is present."""
+    return all(resolve_credentials()[field] for field in CREDENTIAL_FIELDS)
+
+
+def clear_credentials() -> None:
+    """Blank every sidebar credential input and drop the cached connection status."""
+    for field in CREDENTIAL_FIELDS:
+        st.session_state[_widget_key(field)] = ""
+    st.session_state.pop("azure_status", None)
+
+
+def build_azure_client() -> AzureFoundryClient:
+    """Construct an Azure client from the credentials currently in effect."""
+    credentials = resolve_credentials()
+    return AzureFoundryClient(
+        speech_key=credentials["speech_key"],
+        speech_region=credentials["speech_region"],
+        text_analytics_endpoint=credentials["text_analytics_endpoint"],
+        text_analytics_key=credentials["text_analytics_key"],
+    )
+
+
+def render_credential_sidebar() -> None:
+    """Render the Azure credential form and connection status in the sidebar."""
+    st.sidebar.title("🔑 Azure Credentials")
+    st.sidebar.caption(
+        "Values stay in this browser session only — nothing is written to disk, "
+        "to .env, or to the database. Leave a field blank to use the .env value. "
+        "For shared or hosted deployments use platform secrets instead of this form."
+    )
+
+    with st.sidebar.form("azure_credentials"):
+        st.text_input("Speech key", type="password", key=_widget_key("speech_key"))
+        st.text_input(
+            "Speech region",
+            key=_widget_key("speech_region"),
+            placeholder="eastus",
+        )
+        st.text_input(
+            "Text Analytics endpoint",
+            key=_widget_key("text_analytics_endpoint"),
+            placeholder="https://<resource>.cognitiveservices.azure.com/",
+        )
+        st.text_input("Text Analytics key", type="password",
+                      key=_widget_key("text_analytics_key"))
+        st.form_submit_button("Apply for this session")
+
+    st.sidebar.button("🧹 Clear credentials", on_click=clear_credentials)
+    render_connection_status()
+
+
+def render_connection_status() -> None:
+    """Show which services are configured and the last Azure outcome, without values."""
+    credentials = resolve_credentials()
+
+    st.sidebar.subheader("Connection status")
+
+    for label, fields in (
+        ("Speech", ("speech_key", "speech_region")),
+        ("Text Analytics", ("text_analytics_endpoint", "text_analytics_key")),
+    ):
+        if any(not credentials[field] for field in fields):
+            st.sidebar.warning(f"{label}: not configured")
+            continue
+        from_session = [
+            bool((st.session_state.get(_widget_key(field)) or "").strip())
+            for field in fields
+        ]
+        if all(from_session):
+            source = "sidebar"
+        elif any(from_session):
+            source = "sidebar + environment"
+        else:
+            source = "environment"
+        st.sidebar.success(f"{label}: configured ({source})")
+
+    status = st.session_state.get("azure_status")
+    if status:
+        state, message = status
+        if state == "ok":
+            st.sidebar.info("Last Azure call: succeeded")
+        else:
+            st.sidebar.error(f"Last Azure call failed: {message}")
 
 
 def main():
     """Main application."""
     st.title("🎤 " + APP_NAME)
     st.markdown("Transcribe and Summarize Voice Recordings with Azure AI")
+
+    render_credential_sidebar()
 
     # Sidebar navigation
     st.sidebar.title("Navigation")
@@ -65,6 +180,13 @@ def main():
 def upload_page():
     """Upload and process page."""
     st.header("📤 Upload Voice Recording")
+
+    ready = credentials_ready()
+    if not ready:
+        st.warning(
+            "Azure credentials are incomplete. Enter them in the sidebar "
+            "(or set them in .env) to enable processing."
+        )
 
     col1, col2 = st.columns([2, 1])
 
@@ -86,7 +208,7 @@ def upload_page():
     if uploaded_file is not None:
         st.success(f"✓ File selected: {uploaded_file.name}")
 
-        if st.button("🚀 Process Recording", type="primary"):
+        if st.button("🚀 Process Recording", type="primary", disabled=not ready):
             process_recording(uploaded_file, language)
 
 
@@ -107,7 +229,6 @@ def process_recording(uploaded_file, language: str):
         )
 
         # Get transcription record
-        recording = st.session_state.db.get_recording(recording_id)
         transcription = st.session_state.db.get_transcription(recording_id)
         transcription_id = transcription['id']
 
@@ -115,8 +236,10 @@ def process_recording(uploaded_file, language: str):
         progress_bar = st.progress(0, text="Processing audio...")
 
         try:
+            azure_client = build_azure_client()
+
             progress_bar.progress(50, text="Transcribing audio...")
-            transcript, summary = st.session_state.azure_client.transcribe_and_summarize(
+            transcript, summary = azure_client.transcribe_and_summarize(
                 file_path,
                 language
             )
@@ -134,6 +257,7 @@ def process_recording(uploaded_file, language: str):
             st.session_state.db.update_summary(summary_id, summary, "completed")
 
             progress_bar.progress(100, text="Complete!")
+            st.session_state.azure_status = ("ok", "")
             st.success("✓ Processing complete!")
 
             # Display results
@@ -161,16 +285,17 @@ def process_recording(uploaded_file, language: str):
                 )
 
         except Exception as e:
-            st.session_state.db.update_transcription_error(
-                transcription_id,
-                str(e)
-            )
-            st.error(f"❌ Processing failed: {str(e)}")
+            message = sanitize_azure_error(e, _secret_values())
+            st.session_state.db.update_transcription_error(transcription_id, message)
+            st.session_state.azure_status = ("error", message)
+            st.error(f"❌ Processing failed: {message}")
 
     except ValueError as e:
         st.error(f"❌ File error: {str(e)}")
+    except OSError as e:
+        st.error(f"❌ Could not save the upload: {str(e)}")
     except Exception as e:
-        st.error(f"❌ Unexpected error: {str(e)}")
+        st.error(f"❌ Unexpected error: {sanitize_azure_error(e, _secret_values())}")
 
 
 def history_page():
@@ -186,13 +311,12 @@ def history_page():
         st.info("No recordings yet. Start by uploading an audio file!")
         return
 
-    # Create table
     for recording in recordings:
         recording_id = recording['id']
         transcription = st.session_state.db.get_transcription(recording_id)
         summary = None
 
-        if transcription and transcription['id']:
+        if transcription:
             summary = st.session_state.db.get_summary(transcription['id'])
 
         with st.expander(
@@ -205,7 +329,8 @@ def history_page():
                 st.write(f"**Language:** {recording['language']}")
 
             with col2:
-                st.write(f"**Status:** {transcription['status'].upper()}")
+                status = (transcription or {}).get('status') or 'unknown'
+                st.write(f"**Status:** {status.upper()}")
 
             if transcription and transcription['transcript']:
                 st.subheader("Transcript")
@@ -243,7 +368,7 @@ def history_page():
                     key=f"download_summary_{recording_id}"
                 )
 
-            if transcription['error_message']:
+            if transcription and transcription['error_message']:
                 st.error(f"Error: {transcription['error_message']}")
 
 

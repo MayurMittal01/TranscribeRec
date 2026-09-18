@@ -4,7 +4,7 @@ import os
 import shutil
 from datetime import datetime
 from typing import Optional
-from config import UPLOADS_PATH, MAX_FILE_SIZE, ALLOWED_AUDIO_FORMATS
+from src.config import UPLOADS_PATH, MAX_FILE_SIZE, ALLOWED_AUDIO_FORMATS
 
 
 def save_uploaded_file(uploaded_file) -> tuple[str, int]:
@@ -47,12 +47,13 @@ def format_timestamp(timestamp_str: str) -> str:
 
 
 def format_file_size(size_bytes: int) -> str:
-    """Format file size for display."""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024:
-            return f"{size_bytes:.2f} {unit}"
-        file_size /= 1024
-    return f"{size_bytes:.2f} GB"
+    """Format a byte count as a human-readable size string."""
+    size = float(size_bytes)
+    for unit in ['B', 'KB', 'MB']:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} GB"
 
 
 def cleanup_old_files(hours: int = 24) -> None:
