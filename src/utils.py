@@ -1,10 +1,14 @@
 """Utility functions for TranscribeRec."""
 
+import contextlib
 import os
 import shutil
+import wave
 from datetime import datetime
 from typing import Optional
-from src.config import UPLOADS_PATH, MAX_FILE_SIZE, ALLOWED_AUDIO_FORMATS
+from src.config import (
+    UPLOADS_PATH, MAX_FILE_SIZE, MAX_FILE_SIZE_MB, ALLOWED_AUDIO_FORMATS
+)
 
 
 def save_uploaded_file(uploaded_file) -> tuple[str, int]:
@@ -15,7 +19,7 @@ def save_uploaded_file(uploaded_file) -> tuple[str, int]:
     # Check file size
     file_size = len(uploaded_file.getbuffer())
     if file_size > MAX_FILE_SIZE:
-        raise ValueError(f"File size exceeds {MAX_FILE_SIZE / (1024*1024):.0f}MB limit")
+        raise ValueError(f"File size exceeds the {MAX_FILE_SIZE_MB} MB limit")
 
     # Check file format
     file_ext = uploaded_file.name.split('.')[-1].lower()
@@ -54,6 +58,38 @@ def format_file_size(size_bytes: int) -> str:
             return f"{size:.2f} {unit}"
         size /= 1024
     return f"{size:.2f} GB"
+
+
+def estimate_wav_duration(uploaded_file) -> Optional[float]:
+    """Approximate a WAV upload's duration in seconds from its header, or None."""
+    try:
+        uploaded_file.seek(0)
+        with contextlib.closing(wave.open(uploaded_file, "rb")) as handle:
+            frame_rate = handle.getframerate()
+            frames = handle.getnframes()
+    except (wave.Error, OSError, EOFError, ValueError, AttributeError):
+        return None
+    finally:
+        # wave.open leaves the stream mid-file; save_uploaded_file reads it next.
+        with contextlib.suppress(Exception):
+            uploaded_file.seek(0)
+
+    if frame_rate <= 0 or frames <= 0:
+        return None
+    return frames / float(frame_rate)
+
+
+def format_duration(seconds: float) -> str:
+    """Format a duration in seconds as a short human-readable string."""
+    total = int(round(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours} h {minutes} min"
+    if minutes:
+        return f"{minutes} min {secs} s"
+    return f"{secs} s"
 
 
 def cleanup_old_files(hours: int = 24) -> None:

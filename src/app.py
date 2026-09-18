@@ -12,19 +12,19 @@ if _REPO_ROOT not in sys.path:
 import streamlit as st
 
 from src.config import (
-    APP_NAME, ALLOWED_AUDIO_FORMATS, AUDIO_FORMAT_HELP, SUPPORTED_LANGUAGES,
-    DEFAULT_LANGUAGE, env_credentials
+    APP_NAME, ALLOWED_AUDIO_FORMATS, AUDIO_FORMAT_HELP, UPLOAD_LIMIT_HELP,
+    SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, env_credentials
 )
 from src.database import Database
 from src.azure_client import AzureFoundryClient, sanitize_azure_error
-from src.utils import save_uploaded_file, format_timestamp, cleanup_old_files
-
-CREDENTIAL_FIELDS = (
-    "speech_key",
-    "speech_region",
-    "text_analytics_endpoint",
-    "text_analytics_key",
+from src.utils import (
+    save_uploaded_file, format_timestamp, format_file_size, cleanup_old_files,
+    estimate_wav_duration, format_duration
 )
+
+SPEECH_FIELDS = ("speech_key", "speech_region")
+TEXT_ANALYTICS_FIELDS = ("text_analytics_endpoint", "text_analytics_key")
+CREDENTIAL_FIELDS = SPEECH_FIELDS + TEXT_ANALYTICS_FIELDS
 
 STAGE_LABELS = {
     "transcribing": "Transcribing audio with Azure Speech — this runs the whole "
@@ -52,9 +52,17 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
-if 'db' not in st.session_state:
-    st.session_state.db = Database()
+def get_db() -> Database:
+    """Return a database handle.
+
+    Deliberately not cached in session state: a cached instance survives
+    Streamlit's hot reload and then lacks any method added to the class since
+    it was built, which surfaces as a spurious AttributeError mid-run.
+    """
+    return Database()
+
+
+get_db()
 
 
 def _widget_key(field: str) -> str:
@@ -78,9 +86,16 @@ def _secret_values() -> tuple[str, ...]:
     return (credentials["speech_key"], credentials["text_analytics_key"])
 
 
-def credentials_ready() -> bool:
-    """True when every credential needed to reach both Azure services is present."""
-    return all(resolve_credentials()[field] for field in CREDENTIAL_FIELDS)
+def speech_ready() -> bool:
+    """True when Azure Speech credentials are present, so transcription can run."""
+    credentials = resolve_credentials()
+    return all(credentials[field] for field in SPEECH_FIELDS)
+
+
+def text_analytics_ready() -> bool:
+    """True when Azure Text Analytics credentials are present, so summarization can run."""
+    credentials = resolve_credentials()
+    return all(credentials[field] for field in TEXT_ANALYTICS_FIELDS)
 
 
 def clear_credentials() -> None:
@@ -188,11 +203,18 @@ def upload_page():
     """Upload and process page."""
     st.header("📤 Upload Voice Recording")
 
-    ready = credentials_ready()
-    if not ready:
+    can_transcribe = speech_ready()
+    if not can_transcribe:
         st.warning(
-            "Azure credentials are incomplete. Enter them in the sidebar "
-            "(or set them in .env) to enable processing."
+            "Azure Speech credentials are missing, so transcription cannot run. "
+            "Enter the Speech key and region in the sidebar (or set them in .env)."
+        )
+    elif not text_analytics_ready():
+        st.info(
+            "Transcription is ready. Summarization is unavailable — Azure Text "
+            "Analytics is not configured, so recordings will be transcribed and "
+            "the summary step skipped. Add Text Analytics credentials in the "
+            "sidebar to enable it."
         )
 
     col1, col2 = st.columns([2, 1])
@@ -201,9 +223,9 @@ def upload_page():
         uploaded_file = st.file_uploader(
             "Choose an audio file",
             type=ALLOWED_AUDIO_FORMATS,
-            help=AUDIO_FORMAT_HELP
+            help=f"{AUDIO_FORMAT_HELP} {UPLOAD_LIMIT_HELP}"
         )
-        st.caption(AUDIO_FORMAT_HELP)
+        st.caption(f"{AUDIO_FORMAT_HELP} {UPLOAD_LIMIT_HELP}")
 
     with col2:
         language = st.selectbox(
@@ -215,11 +237,29 @@ def upload_page():
 
     if uploaded_file is not None:
         st.success(f"✓ File selected: {uploaded_file.name}")
+        render_upload_estimate(uploaded_file)
 
-        if st.button("🚀 Process Recording", type="primary", disabled=not ready):
+        if st.button("🚀 Process Recording", type="primary",
+                     disabled=not can_transcribe):
             process_recording(uploaded_file, language)
 
     render_last_run()
+
+
+def render_upload_estimate(uploaded_file) -> None:
+    """Show the selected file's size and approximate audio duration."""
+    size_text = format_file_size(len(uploaded_file.getbuffer()))
+    duration = estimate_wav_duration(uploaded_file)
+
+    if duration is None:
+        st.caption(f"Size: {size_text}. Duration could not be read from the WAV header.")
+        return
+
+    st.info(
+        f"Size: {size_text} — approximately {format_duration(duration)} of audio. "
+        "Azure Speech streams the recording in real time, so transcription takes "
+        "roughly as long as the audio itself and is billed for the full duration."
+    )
 
 
 def process_recording(uploaded_file, language: str) -> None:
@@ -231,13 +271,13 @@ def process_recording(uploaded_file, language: str) -> None:
         with st.status("Saving upload...", expanded=True) as status:
             file_path, file_size = save_uploaded_file(uploaded_file)
 
-            recording_id = st.session_state.db.add_recording(
+            recording_id = get_db().add_recording(
                 uploaded_file.name,
                 file_path,
                 file_size,
                 language
             )
-            transcription_id = st.session_state.db.get_transcription(recording_id)['id']
+            transcription_id = get_db().get_transcription(recording_id)['id']
             run = {"recording_id": recording_id, "filename": uploaded_file.name}
 
             def report_stage(stage: str) -> None:
@@ -246,7 +286,7 @@ def process_recording(uploaded_file, language: str) -> None:
 
             def save_transcript(transcript: str) -> None:
                 """Commit the transcript before summarization is attempted."""
-                st.session_state.db.update_transcription(
+                get_db().update_transcription(
                     transcription_id,
                     transcript,
                     "completed"
@@ -262,9 +302,19 @@ def process_recording(uploaded_file, language: str) -> None:
                 )
 
                 status.update(label="Saving results...")
-                summary_id = st.session_state.db.add_summary(transcription_id)
-                if result.summary_error:
-                    st.session_state.db.update_summary_error(summary_id, result.summary_error)
+                summary_id = get_db().add_summary(transcription_id)
+                if result.summary_skipped:
+                    get_db().update_summary_skipped(
+                        summary_id, result.summary_skipped
+                    )
+                    st.session_state.azure_status = ("ok", "")
+                    status.update(
+                        label="Transcribed — summarization skipped",
+                        state="complete",
+                        expanded=False,
+                    )
+                elif result.summary_error:
+                    get_db().update_summary_error(summary_id, result.summary_error)
                     st.session_state.azure_status = ("error", result.summary_error)
                     status.update(
                         label="Transcribed — summary failed",
@@ -272,7 +322,7 @@ def process_recording(uploaded_file, language: str) -> None:
                         expanded=False,
                     )
                 else:
-                    st.session_state.db.update_summary(summary_id, result.summary, "completed")
+                    get_db().update_summary(summary_id, result.summary, "completed")
                     st.session_state.azure_status = ("ok", "")
                     status.update(label="Done", state="complete", expanded=False)
 
@@ -280,12 +330,13 @@ def process_recording(uploaded_file, language: str) -> None:
                     transcript=result.transcript,
                     summary=result.summary,
                     summary_error=result.summary_error,
+                    summary_skipped=result.summary_skipped,
                 )
 
             except Exception as e:
                 failure = sanitize_azure_error(e, _secret_values())
                 partial = getattr(e, "partial_transcript", "") or ""
-                st.session_state.db.update_transcription_error(
+                get_db().update_transcription_error(
                     transcription_id, failure, partial or None
                 )
                 st.session_state.azure_status = ("error", failure)
@@ -336,7 +387,12 @@ def render_last_run() -> None:
             key="last_run_download_transcript",
         )
 
-    if run.get("summary_error"):
+    if run.get("summary_skipped"):
+        st.info(
+            f"ℹ️ Summarization was skipped — {run['summary_skipped']}. "
+            "The transcript above is complete."
+        )
+    elif run.get("summary_error"):
         st.warning(
             "⚠️ The transcript was saved, but summarization failed: "
             f"{run['summary_error']}"
@@ -361,7 +417,7 @@ def history_page():
     # Cleanup old files periodically
     cleanup_old_files(hours=24)
 
-    recordings = st.session_state.db.get_recordings()
+    recordings = get_db().get_recordings()
 
     if not recordings:
         st.info("No recordings yet. Start by uploading an audio file!")
@@ -369,11 +425,11 @@ def history_page():
 
     for recording in recordings:
         recording_id = recording['id']
-        transcription = st.session_state.db.get_transcription(recording_id)
+        transcription = get_db().get_transcription(recording_id)
         summary = None
 
         if transcription:
-            summary = st.session_state.db.get_summary(transcription['id'])
+            summary = get_db().get_summary(transcription['id'])
 
         with st.expander(
             f"📁 {recording['filename']} - {format_timestamp(recording['upload_date'])}"
@@ -406,7 +462,12 @@ def history_page():
                     key=f"download_transcript_{recording_id}"
                 )
 
-            if summary and summary['error_message']:
+            if summary and summary['status'] == 'skipped':
+                st.info(
+                    "Summarization skipped — "
+                    f"{summary['error_message'] or 'not attempted'}."
+                )
+            elif summary and summary['error_message']:
                 st.warning(
                     "Transcript saved, but summarization failed: "
                     f"{summary['error_message']}"

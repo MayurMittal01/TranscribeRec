@@ -48,13 +48,21 @@ class SummarizationError(Exception):
     """Raised when Azure Text Analytics cannot produce a summary."""
 
 
+SUMMARY_SKIPPED_REASON = "Text Analytics not configured"
+
+
 @dataclass
 class PipelineResult:
-    """Outcome of one transcribe-then-summarize run; the summary may be missing."""
+    """Outcome of one transcribe-then-summarize run; the summary may be missing.
+
+    `summary_error` means summarization was attempted and failed;
+    `summary_skipped` means it was never attempted. They are distinct states.
+    """
 
     transcript: str
     summary: Optional[str] = None
     summary_error: Optional[str] = None
+    summary_skipped: Optional[str] = None
 
 
 def sanitize_azure_error(
@@ -410,14 +418,28 @@ class AzureFoundryClient:
     """Unified client for Azure Foundry services."""
 
     def __init__(self, speech_key: str, speech_region: str,
-                 text_analytics_endpoint: str, text_analytics_key: str):
-        """Initialize both Azure clients from explicit credentials."""
+                 text_analytics_endpoint: str = "", text_analytics_key: str = ""):
+        """Initialize the Speech client, and Text Analytics only if configured.
+
+        Text Analytics is optional because abstractive summarization is not
+        offered in every region a Speech resource can live in; transcription
+        must still run without it.
+        """
         self.speech_client = AzureSpeechClient(speech_key, speech_region)
-        self.text_client = AzureTextAnalyticsClient(text_analytics_endpoint, text_analytics_key)
+        self.text_client: Optional[AzureTextAnalyticsClient] = None
+        if text_analytics_endpoint and text_analytics_key:
+            self.text_client = AzureTextAnalyticsClient(
+                text_analytics_endpoint, text_analytics_key
+            )
+
+    def summarization_available(self) -> bool:
+        """True when Text Analytics credentials were supplied."""
+        return self.text_client is not None
 
     def secrets(self) -> tuple[Optional[str], ...]:
         """Return the secret values held by this client, for error sanitization."""
-        return (self.speech_client.api_key, self.text_client.api_key)
+        text_key = self.text_client.api_key if self.text_client else None
+        return (self.speech_client.api_key, text_key)
 
     def transcribe_and_summarize(
         self,
@@ -431,7 +453,8 @@ class AzureFoundryClient:
         `on_transcript` is called with the transcript as soon as Speech returns it,
         so the caller can persist billed work before summarization is attempted. A
         summarization failure is reported on the result, not raised: the transcript
-        is the expensive half and must survive it.
+        is the expensive half and must survive it. Without Text Analytics
+        credentials the summarization stage is skipped entirely.
         """
         if on_stage:
             on_stage("transcribing")
@@ -439,6 +462,11 @@ class AzureFoundryClient:
 
         if on_transcript:
             on_transcript(transcript)
+
+        if self.text_client is None:
+            return PipelineResult(
+                transcript=transcript, summary_skipped=SUMMARY_SKIPPED_REASON
+            )
 
         if on_stage:
             on_stage("summarizing")

@@ -60,4 +60,6 @@ data/uploads/*
 htmlcov/
 
 # Streamlit
-.streamlit/
+# config.toml carries the upload limit and must be shared; secrets.toml must not
+.streamlit/*
+!.streamlit/config.toml

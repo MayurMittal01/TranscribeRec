@@ -137,15 +137,30 @@ class Database:
 
     def update_transcription_error(self, transcription_id: int, error_message: str,
                                    partial_transcript: Optional[str] = None) -> None:
-        """Mark a transcription failed, keeping any text recognized before the failure."""
-        status = "partial" if partial_transcript else "failed"
+        """Mark a transcription failed, never discarding text already recognized.
+
+        A failure after the transcript was committed must not blank it; the run
+        keeps whatever text exists and is recorded as partial rather than failed.
+        """
         with self._cursor(commit=True) as cursor:
-            cursor.execute("""
-                UPDATE transcriptions
-                SET status = ?, transcript = ?, error_message = ?,
-                    completed_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (status, partial_transcript, error_message, transcription_id))
+            if partial_transcript:
+                cursor.execute("""
+                    UPDATE transcriptions
+                    SET status = 'partial', transcript = ?, error_message = ?,
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (partial_transcript, error_message, transcription_id))
+            else:
+                cursor.execute("""
+                    UPDATE transcriptions
+                    SET status = CASE
+                            WHEN transcript IS NOT NULL AND transcript != '' THEN 'partial'
+                            ELSE 'failed'
+                        END,
+                        error_message = ?,
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (error_message, transcription_id))
 
     def get_transcription(self, recording_id: int) -> Optional[Dict[str, Any]]:
         """Get transcription for a recording."""
@@ -186,6 +201,18 @@ class Database:
                 SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             """, (error_message, summary_id))
+
+    def update_summary_skipped(self, summary_id: int, reason: str) -> None:
+        """Mark a summary as never attempted, recording why.
+
+        Distinct from 'failed': no Azure call was made, so this is not an error.
+        """
+        with self._cursor(commit=True) as cursor:
+            cursor.execute("""
+                UPDATE summaries
+                SET status = 'skipped', error_message = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (reason, summary_id))
 
     def get_summary(self, transcription_id: int) -> Optional[Dict[str, Any]]:
         """Get summary for a transcription."""

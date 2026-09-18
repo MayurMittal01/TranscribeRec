@@ -31,8 +31,12 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DATABASE_PATH = "data/transcribe_rec.db"
 UPLOADS_PATH = "data/uploads"
 
-# File Upload Configuration
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
+# File Upload Configuration. Roughly 50 minutes of 16 kHz 16-bit mono PCM.
+# Streamlit reads its own upload cap from .streamlit/config.toml before any
+# Python runs, so `server.maxUploadSize` there must be kept equal to this value
+# or the uploader will advertise a limit the app does not honour.
+MAX_FILE_SIZE_MB = 100
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 
 # WAV only: the Speech SDK's AudioConfig(filename=...) decodes WAV/PCM natively,
 # and every other container needs GStreamer binaries on PATH.
@@ -41,6 +45,10 @@ AUDIO_FORMAT_HELP = (
     "WAV only (16 kHz, 16-bit, mono PCM). Azure Speech reads WAV directly; "
     "MP3, M4A, FLAC and OGG need a GStreamer runtime on PATH, so they are "
     "not accepted here. Convert to WAV before uploading."
+)
+UPLOAD_LIMIT_HELP = (
+    f"Maximum {MAX_FILE_SIZE_MB} MB per file — about 50 minutes of "
+    "16 kHz, 16-bit mono PCM."
 )
 
 # Processing Configuration

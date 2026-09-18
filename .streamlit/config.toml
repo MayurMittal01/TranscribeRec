@@ -1,0 +1,4 @@
+[server]
+# Must stay equal to MAX_FILE_SIZE_MB in src/config.py. Streamlit parses this
+# file before the app imports, so the value cannot be read from Python.
+maxUploadSize = 100
